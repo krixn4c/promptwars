@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import type { FirstAidResponse } from "@/lib/types";
+import { sanitizeInput, validateTextInput, validateImageFile } from "@/lib/validation";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+
+const ALLOWED_LANGUAGES = new Set([
+  "English", "Hindi", "Spanish", "French", "Tamil", "Telugu",
+]);
 
 const SYSTEM_PROMPT = (language: string) => `
 You are CampusAid, an emergency first-aid assistant for college campuses.
@@ -31,17 +35,43 @@ Respond with this exact JSON shape:
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
-    const text = formData.get("text") as string | null;
+    const rawText = formData.get("text") as string | null;
     const imageFile = formData.get("image") as File | null;
-    const language = (formData.get("language") as string) || "English";
+    const rawLanguage = (formData.get("language") as string) || "English";
 
-    if (!text && !imageFile) {
+    // Validate and sanitize language
+    const language = ALLOWED_LANGUAGES.has(rawLanguage) ? rawLanguage : "English";
+
+    // Validate inputs
+    if (!rawText && !imageFile) {
       return NextResponse.json(
         { error: "Please provide text or an image." },
         { status: 400 }
       );
     }
 
+    if (rawText && !validateTextInput(rawText)) {
+      return NextResponse.json(
+        { error: "Text must be between 1 and 1000 characters." },
+        { status: 400 }
+      );
+    }
+
+    if (imageFile) {
+      const imageValidation = validateImageFile(imageFile);
+      if (!imageValidation.valid) {
+        return NextResponse.json({ error: imageValidation.error }, { status: 400 });
+      }
+    }
+
+    // Sanitize text input
+    const text = rawText ? sanitizeInput(rawText) : null;
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json({ error: "Server configuration error." }, { status: 500 });
+    }
+    const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -70,11 +100,30 @@ export async function POST(req: NextRequest) {
       generationConfig: {
         responseMimeType: "application/json",
         temperature: 0.2,
+        maxOutputTokens: 1024,
       },
     });
 
-    const rawText = result.response.text();
-    const parsed: FirstAidResponse = JSON.parse(rawText);
+    const responseText = result.response.text();
+
+    let parsed: FirstAidResponse;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch {
+      console.error("Invalid JSON from Gemini:", responseText);
+      return NextResponse.json(
+        { error: "AI returned an unexpected response. Please try again." },
+        { status: 500 }
+      );
+    }
+
+    // Validate required fields are present
+    if (!parsed.condition || !parsed.severity || !Array.isArray(parsed.steps)) {
+      return NextResponse.json(
+        { error: "Incomplete response from AI. Please try again." },
+        { status: 500 }
+      );
+    }
 
     return NextResponse.json(parsed);
   } catch (err) {
