@@ -3,14 +3,13 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import type { FirstAidResponse } from "@/lib/types";
 import { sanitizeInput, validateTextInput, validateImageFile } from "@/lib/validation";
 
-
 const ALLOWED_LANGUAGES = new Set([
   "English", "Hindi", "Spanish", "French", "Tamil", "Telugu",
 ]);
 
 const SYSTEM_PROMPT = (language: string) => `
 You are CampusAid, an emergency first-aid assistant for college campuses.
-Given a description or image of a medical situation or safety hazard, respond ONLY with valid JSON.
+Given a description or image of a medical situation or safety hazard, respond ONLY with valid JSON — no markdown, no code blocks, just raw JSON.
 
 Rules:
 - Be calm, clear, and practical
@@ -19,17 +18,19 @@ Rules:
 - If the situation is life-threatening, make callEmergencyIf very clear
 - The "translatedSummary" field must be a brief 2-3 sentence summary written in ${language}
 
-Respond with this exact JSON shape:
+Respond with ONLY this JSON (no extra text):
 {
-  "condition": "string - name of the condition/hazard",
-  "severity": "low | medium | high | critical",
-  "steps": ["array of step-by-step first aid instructions"],
-  "doNot": ["array of things NOT to do"],
-  "callEmergencyIf": ["conditions that require calling 911/emergency services"],
-  "estimatedTime": "string - estimated time to perform first aid e.g. '3-5 minutes'",
-  "translatedSummary": "string - brief summary in ${language}",
+  "condition": "name of the condition or hazard",
+  "severity": "low",
+  "steps": ["step 1", "step 2"],
+  "doNot": ["thing 1"],
+  "callEmergencyIf": ["condition 1"],
+  "estimatedTime": "2-3 minutes",
+  "translatedSummary": "brief summary in ${language}",
   "disclaimer": "This is AI-generated first aid guidance. Always call emergency services for serious injuries."
 }
+
+severity must be one of: low, medium, high, critical
 `;
 
 export async function POST(req: NextRequest) {
@@ -64,15 +65,18 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Sanitize text input
     const text = rawText ? sanitizeInput(rawText) : null;
 
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      return NextResponse.json({ error: "Server configuration error." }, { status: 500 });
+      return NextResponse.json({ error: "Server configuration error: missing API key." }, { status: 500 });
     }
+
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = genAI.getGenerativeModel({
+      model: "gemini-3.6-flash",
+      systemInstruction: SYSTEM_PROMPT(language),
+    });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const parts: any[] = [];
@@ -96,28 +100,32 @@ export async function POST(req: NextRequest) {
 
     const result = await model.generateContent({
       contents: [{ role: "user", parts }],
-      systemInstruction: SYSTEM_PROMPT(language),
       generationConfig: {
-        responseMimeType: "application/json",
         temperature: 0.2,
         maxOutputTokens: 1024,
       },
     });
 
-    const responseText = result.response.text();
+    const responseText = result.response.text().trim();
+
+    // Strip markdown code fences if model wraps the JSON
+    const cleaned = responseText
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/, "")
+      .trim();
 
     let parsed: FirstAidResponse;
     try {
-      parsed = JSON.parse(responseText);
+      parsed = JSON.parse(cleaned);
     } catch {
       console.error("Invalid JSON from Gemini:", responseText);
       return NextResponse.json(
-        { error: "AI returned an unexpected response. Please try again." },
+        { error: "AI returned an unexpected response format. Please try again." },
         { status: 500 }
       );
     }
 
-    // Validate required fields are present
+    // Validate required fields
     if (!parsed.condition || !parsed.severity || !Array.isArray(parsed.steps)) {
       return NextResponse.json(
         { error: "Incomplete response from AI. Please try again." },
@@ -125,11 +133,25 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Ensure arrays exist even if model skipped them
+    parsed.doNot = parsed.doNot ?? [];
+    parsed.callEmergencyIf = parsed.callEmergencyIf ?? [];
+
     return NextResponse.json(parsed);
-  } catch (err) {
-    console.error("Gemini API error:", err);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("Gemini API error:", message);
+
+    // Surface a more helpful message for invalid key errors
+    if (message.includes("API_KEY_INVALID") || message.includes("401")) {
+      return NextResponse.json(
+        { error: "Invalid Gemini API key. Please check your .env.local file." },
+        { status: 500 }
+      );
+    }
+
     return NextResponse.json(
-      { error: "Failed to analyze the situation. Please try again." },
+      { error: `Analysis failed: ${message}` },
       { status: 500 }
     );
   }
