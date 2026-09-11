@@ -7,6 +7,13 @@ const ALLOWED_LANGUAGES = new Set([
   "English", "Hindi", "Spanish", "French", "Tamil", "Telugu",
 ]);
 
+// Model chain: try in order on 503 overload errors
+const MODEL_CHAIN = [
+  "gemini-3.6-flash",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-8b",
+];
+
 const SYSTEM_PROMPT = (language: string) => `
 You are CampusAid, an emergency first-aid assistant for college campuses.
 Given a description or image of a medical situation or safety hazard, respond ONLY with valid JSON — no markdown, no code blocks, just raw JSON.
@@ -33,6 +40,56 @@ Respond with ONLY this JSON (no extra text):
 severity must be one of: low, medium, high, critical
 `;
 
+/** Call Gemini with retry across model chain on 503 overload */
+async function callGeminiWithFallback(
+  apiKey: string,
+  language: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  parts: any[]
+): Promise<string> {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const requestConfig = {
+    contents: [{ role: "user" as const, parts }],
+    generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
+  };
+
+  let lastError: Error = new Error("No model available");
+
+  for (const modelName of MODEL_CHAIN) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          systemInstruction: SYSTEM_PROMPT(language),
+        });
+        const result = await model.generateContent(requestConfig);
+        return result.response.text().trim();
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        lastError = e instanceof Error ? e : new Error(msg);
+
+        const isOverload =
+          msg.includes("503") ||
+          msg.includes("overload") ||
+          msg.includes("Service Unavailable") ||
+          msg.includes("high demand");
+
+        if (!isOverload) {
+          // Not a capacity error — throw immediately, no point trying other models
+          throw lastError;
+        }
+
+        // Overload: wait before retry (1s first attempt, skip wait on last attempt of last model)
+        if (attempt === 0) {
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+    }
+  }
+
+  throw lastError;
+}
+
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
@@ -40,10 +97,8 @@ export async function POST(req: NextRequest) {
     const imageFile = formData.get("image") as File | null;
     const rawLanguage = (formData.get("language") as string) || "English";
 
-    // Validate and sanitize language
     const language = ALLOWED_LANGUAGES.has(rawLanguage) ? rawLanguage : "English";
 
-    // Validate inputs
     if (!rawText && !imageFile) {
       return NextResponse.json(
         { error: "Please provide text or an image." },
@@ -69,14 +124,11 @@ export async function POST(req: NextRequest) {
 
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      return NextResponse.json({ error: "Server configuration error: missing API key." }, { status: 500 });
+      return NextResponse.json(
+        { error: "Server configuration error: missing API key." },
+        { status: 500 }
+      );
     }
-
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-      model: "gemini-3.6-flash",
-      systemInstruction: SYSTEM_PROMPT(language),
-    });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const parts: any[] = [];
@@ -95,18 +147,9 @@ export async function POST(req: NextRequest) {
     const userText = text
       ? `Emergency situation: ${text}`
       : "Analyze this image and identify the medical emergency or safety hazard shown.";
-
     parts.push({ text: userText });
 
-    const result = await model.generateContent({
-      contents: [{ role: "user", parts }],
-      generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens: 4096,
-      },
-    });
-
-    const responseText = result.response.text().trim();
+    const responseText = await callGeminiWithFallback(apiKey, language, parts);
 
     // Strip markdown code fences if model wraps the JSON
     const cleaned = responseText
@@ -125,7 +168,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Validate required fields
     if (!parsed.condition || !parsed.severity || !Array.isArray(parsed.steps)) {
       return NextResponse.json(
         { error: "Incomplete response from AI. Please try again." },
@@ -133,7 +175,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Ensure arrays exist even if model skipped them
     parsed.doNot = parsed.doNot ?? [];
     parsed.callEmergencyIf = parsed.callEmergencyIf ?? [];
 
@@ -142,11 +183,17 @@ export async function POST(req: NextRequest) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("Gemini API error:", message);
 
-    // Surface a more helpful message for invalid key errors
     if (message.includes("API_KEY_INVALID") || message.includes("401")) {
       return NextResponse.json(
         { error: "Invalid Gemini API key. Please check your .env.local file." },
         { status: 500 }
+      );
+    }
+
+    if (message.includes("503") || message.includes("high demand") || message.includes("Service Unavailable")) {
+      return NextResponse.json(
+        { error: "Gemini AI is temporarily overloaded. Please wait a few seconds and try again." },
+        { status: 503 }
       );
     }
 
