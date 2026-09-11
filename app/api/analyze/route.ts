@@ -102,7 +102,7 @@ export async function POST(req: NextRequest) {
       contents: [{ role: "user", parts }],
       generationConfig: {
         temperature: 0.2,
-        maxOutputTokens: 1024,
+        maxOutputTokens: 4096,
       },
     });
 
