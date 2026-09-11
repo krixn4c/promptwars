@@ -24,7 +24,7 @@ function getRateLimitInfo(ip: string): { allowed: boolean; remaining: number } {
   return { allowed: true, remaining: RATE_LIMIT - entry.count };
 }
 
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
   // Only rate-limit API routes
   if (!request.nextUrl.pathname.startsWith("/api/")) {
     return NextResponse.next();
